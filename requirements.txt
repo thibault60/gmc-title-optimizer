@@ -2,3 +2,4 @@ streamlit>=1.36
 pandas>=2.1
 requests>=2.31
 rapidfuzz>=3.6
+openpyxl>=3.1
