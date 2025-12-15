@@ -18,7 +18,9 @@ BRAND_DEFAULT = "Garnier-Thiebaut"
 VERTICAL_DEFAULT = "Nappes"
 MAX_TITLE_LEN = 150
 
-STOPWORDS_FR = {"de", "la", "le", "les", "des", "du", "d", "et", "a", "à", "en", "pour", "avec", "sur", "dans"}
+STOPWORDS_FR = {
+    "de", "la", "le", "les", "des", "du", "d", "et", "a", "à", "en", "pour", "avec", "sur", "dans"
+}
 
 # =========================
 # DATA STRUCTURES
@@ -29,12 +31,24 @@ class KeywordRow:
     volume: float
 
 # =========================
-# UTILITIES
+# FILE READERS
 # =========================
 def read_any(file) -> pd.DataFrame:
-    if file.name.lower().endswith(".csv"):
-        return pd.read_csv(file)
-    return pd.read_excel(file)
+    """
+    Supporte CSV et XLSX.
+    - CSV: essaie ',' puis ';' si nécessaire
+    - XLSX: nécessite openpyxl
+    """
+    name = file.name.lower()
+    if name.endswith(".csv"):
+        # tentative virgule
+        try:
+            return pd.read_csv(file)
+        except Exception:
+            file.seek(0)
+            return pd.read_csv(file, sep=";")
+    # xlsx
+    return pd.read_excel(file, engine="openpyxl")
 
 def as_float(x, default=0.0) -> float:
     try:
@@ -46,6 +60,9 @@ def as_float(x, default=0.0) -> float:
     except Exception:
         return default
 
+# =========================
+# KEYWORD SCORING
+# =========================
 def _minmax(values: List[float]) -> List[float]:
     if not values:
         return []
@@ -70,9 +87,13 @@ def rank_keywords_for_product(
         rel = fuzz.token_set_ratio(p, k.keyword.lower()) / 100.0
         score = (w_relevance * rel) + (w_volume * v_norm)
         scored.append((k, score, rel))
+
     scored.sort(key=lambda x: x[1], reverse=True)
     return scored[:top_k]
 
+# =========================
+# TITLE RULES / QA
+# =========================
 def validate_title(title: str, brand: str) -> List[str]:
     issues = []
     t = (title or "").strip()
@@ -110,7 +131,7 @@ def added_terms(old: str, new: str) -> List[str]:
     return add[:12]
 
 # =========================
-# OPENAI CLIENT (Responses + JSON Schema)
+# OPENAI HELPERS
 # =========================
 def extract_output_text(resp_json: Dict[str, Any]) -> str:
     for item in resp_json.get("output", []):
@@ -119,6 +140,23 @@ def extract_output_text(resp_json: Dict[str, Any]) -> str:
                 if c.get("type") == "output_text" and isinstance(c.get("text"), str):
                     return c["text"]
     raise ValueError("Impossible d'extraire output_text.")
+
+def openai_list_models(api_key: str) -> List[str]:
+    r = requests.get(
+        "https://api.openai.com/v1/models",
+        headers={"Authorization": f"Bearer {api_key}"},
+        timeout=30,
+    )
+    if r.status_code != 200:
+        try:
+            j = r.json()
+            msg = j.get("error", {}).get("message", r.text)
+        except Exception:
+            msg = r.text
+        raise RuntimeError(f"List models failed HTTP {r.status_code}: {msg}")
+
+    j = r.json()
+    return sorted([m["id"] for m in j.get("data", []) if "id" in m])
 
 def openai_generate_structured(
     *,
@@ -155,8 +193,18 @@ def openai_generate_structured(
         json=payload,
         timeout=60,
     )
+
     if r.status_code < 200 or r.status_code >= 300:
-        raise RuntimeError(f"OpenAI API error {r.status_code}: {r.text}")
+        # message d'erreur exploitable
+        try:
+            j = r.json()
+            err = j.get("error", {})
+            msg = err.get("message", r.text)
+            code = err.get("code", "")
+            typ = err.get("type", "")
+            raise RuntimeError(f"OpenAI HTTP {r.status_code} | type={typ} code={code} | {msg}")
+        except Exception:
+            raise RuntimeError(f"OpenAI HTTP {r.status_code} | {r.text}")
 
     data = r.json()
     txt = extract_output_text(data)
@@ -174,6 +222,10 @@ def optimize_nappe_title(
     description: str,
     keywords: List[KeywordRow],
 ) -> Dict[str, Any]:
+    # évite les prompts trop longs
+    current_title = (current_title or "")[:220]
+    description = (description or "")[:1200]
+
     product_text = f"{current_title}\n{description}".strip()
     ranked = rank_keywords_for_product(product_text, keywords, top_k=6)
 
@@ -225,15 +277,31 @@ Rends:
 - notes (1 phrase: pourquoi ces mots-clés)
 """.strip()
 
-    out = openai_generate_structured(
-        api_key=api_key,
-        model=model,
-        system_prompt=system_prompt,
-        user_prompt=user_prompt,
-        schema=schema,
-        temperature=0.2,
-        max_output_tokens=240,
-    )
+    # appel principal + fallback automatique si modèle non dispo
+    try:
+        out = openai_generate_structured(
+            api_key=api_key,
+            model=model,
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            schema=schema,
+            temperature=0.2,
+            max_output_tokens=240,
+        )
+    except RuntimeError as e:
+        msg = str(e).lower()
+        if ("model" in msg and "not found" in msg) or ("model_not_found" in msg):
+            out = openai_generate_structured(
+                api_key=api_key,
+                model="gpt-4o-mini",
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                schema=schema,
+                temperature=0.2,
+                max_output_tokens=240,
+            )
+        else:
+            raise
 
     opt = enforce_basic_rules(out["optimized_title"], brand)
     issues = validate_title(opt, brand)
@@ -253,7 +321,7 @@ Rends:
 # STREAMLIT UI
 # =========================
 st.set_page_config(page_title="GMC Title Optimizer (Nappes)", layout="wide")
-st.title("Optimisation Titles GMC — Verticale Nappes (sans CTR)")
+st.title("Optimisation Titles GMC — Verticale Nappes (keyword + volume)")
 
 # secrets -> env
 if "OPENAI_API_KEY" in st.secrets:
@@ -267,12 +335,29 @@ if not api_key:
 with st.sidebar:
     st.header("Paramètres")
     brand = st.text_input("Marque", BRAND_DEFAULT)
-    model = st.selectbox("Modèle", ["gpt-5-mini", "gpt-4o-mini"], index=0)
+    # modèle safe par défaut
+    model = st.selectbox("Modèle", ["gpt-4o-mini", "gpt-5-mini"], index=0)
     n_rows = st.slider("Nombre de lignes à traiter (démo)", 1, 200, 10)
 
+    if st.button("Tester la clé + lister les modèles"):
+        try:
+            models = openai_list_models(api_key)
+            st.success("OK : clé API valide ✅")
+            pick = [m for m in models if ("gpt-4o" in m or "gpt-5" in m)]
+            st.write("Modèles détectés (filtrés):")
+            st.write(pick[:80] if pick else models[:80])
+        except Exception as e:
+            st.error(str(e))
+
 st.subheader("1) Import des données")
-prod_file = st.file_uploader("Produits (CSV/XLSX) — colonnes: title, description", type=["csv", "xlsx"])
-kw_file = st.file_uploader("Mots-clés Nappes (CSV/XLSX) — colonnes: keyword, volume", type=["csv", "xlsx"])
+prod_file = st.file_uploader(
+    "Produits (CSV/XLSX) — colonnes: title, description",
+    type=["csv", "xlsx"]
+)
+kw_file = st.file_uploader(
+    "Mots-clés Nappes (CSV/XLSX) — colonnes: keyword, volume",
+    type=["csv", "xlsx"]
+)
 
 if not prod_file or not kw_file:
     st.info("Importe les 2 fichiers pour lancer l’optimisation.")
@@ -285,11 +370,27 @@ st.write("Aperçu produits", df_prod.head())
 st.write("Aperçu mots-clés", df_kw.head())
 
 st.subheader("2) Mapping colonnes")
-col_title = st.selectbox("Colonne Title (produits)", df_prod.columns, index=list(df_prod.columns).index("title") if "title" in df_prod.columns else 0)
-col_desc = st.selectbox("Colonne Description (produits)", df_prod.columns, index=list(df_prod.columns).index("description") if "description" in df_prod.columns else 0)
+col_title = st.selectbox(
+    "Colonne Title (produits)",
+    df_prod.columns,
+    index=list(df_prod.columns).index("title") if "title" in df_prod.columns else 0
+)
+col_desc = st.selectbox(
+    "Colonne Description (produits)",
+    df_prod.columns,
+    index=list(df_prod.columns).index("description") if "description" in df_prod.columns else 0
+)
 
-col_kw = st.selectbox("Colonne Keyword", df_kw.columns, index=list(df_kw.columns).index("keyword") if "keyword" in df_kw.columns else 0)
-col_vol = st.selectbox("Colonne Volume", df_kw.columns, index=list(df_kw.columns).index("volume") if "volume" in df_kw.columns else 0)
+col_kw = st.selectbox(
+    "Colonne Keyword (mots-clés)",
+    df_kw.columns,
+    index=list(df_kw.columns).index("keyword") if "keyword" in df_kw.columns else 0
+)
+col_vol = st.selectbox(
+    "Colonne Volume (mots-clés)",
+    df_kw.columns,
+    index=list(df_kw.columns).index("volume") if "volume" in df_kw.columns else 0
+)
 
 keywords: List[KeywordRow] = []
 for _, r in df_kw.iterrows():
@@ -298,26 +399,44 @@ for _, r in df_kw.iterrows():
         continue
     keywords.append(KeywordRow(keyword=k, volume=as_float(r[col_vol], 0.0)))
 
+if not keywords:
+    st.error("Aucun mot-clé valide détecté (vérifie les colonnes keyword/volume).")
+    st.stop()
+
 st.subheader("3) Optimisation")
 if st.button("Optimiser les titles (Nappes)"):
     df = df_prod.head(n_rows).copy()
+
     results = []
     prog = st.progress(0)
 
-    for _, row in df.iterrows():
+    for i, (_, row) in enumerate(df.iterrows(), start=1):
         cur_title = str(row[col_title]) if pd.notna(row[col_title]) else ""
         desc = str(row[col_desc]) if pd.notna(row[col_desc]) else ""
 
-        out = optimize_nappe_title(
-            api_key=api_key,
-            model=model,
-            brand=brand,
-            current_title=cur_title,
-            description=desc,
-            keywords=keywords,
-        )
-        results.append(out)
-        prog.progress(min(1.0, len(results) / max(1, n_rows)))
+        try:
+            out = optimize_nappe_title(
+                api_key=api_key,
+                model=model,
+                brand=brand,
+                current_title=cur_title,
+                description=desc,
+                keywords=keywords,
+            )
+            results.append(out)
+        except Exception as e:
+            # on n'arrête pas tout : on loggue l'erreur par ligne
+            results.append({
+                "title_current": cur_title,
+                "title_optimized": "",
+                "added_terms": "",
+                "used_keywords": "",
+                "notes": "",
+                "validation_issues": f"ERREUR: {str(e)}",
+                "keyword_candidates": "",
+            })
+
+        prog.progress(min(1.0, i / max(1, n_rows)))
 
     res_df = pd.DataFrame(results)
     st.success("Terminé ✅")
