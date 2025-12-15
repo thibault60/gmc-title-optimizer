@@ -27,7 +27,6 @@ STOPWORDS_FR = {"de", "la", "le", "les", "des", "du", "d", "et", "a", "à", "en"
 class KeywordRow:
     keyword: str
     volume: float
-    ctr: float
 
 # =========================
 # UTILITIES
@@ -41,7 +40,6 @@ def as_float(x, default=0.0) -> float:
     try:
         if pd.isna(x):
             return default
-        # gère "1 234" et "12,3"
         s = str(x).replace(" ", "").replace(",", ".")
         m = re.search(r"-?\d+(\.\d+)?", s)
         return float(m.group(0)) if m else default
@@ -60,19 +58,17 @@ def rank_keywords_for_product(
     product_text: str,
     keywords: List[KeywordRow],
     *,
-    w_relevance: float = 0.60,
+    w_relevance: float = 0.70,
     w_volume: float = 0.30,
-    w_ctr: float = 0.10,
     top_k: int = 6,
 ) -> List[Tuple[KeywordRow, float, float]]:
     vols = _minmax([k.volume for k in keywords])
-    ctrs = _minmax([k.ctr for k in keywords])
 
     scored = []
     p = product_text.lower()
-    for k, v_norm, c_norm in zip(keywords, vols, ctrs):
+    for k, v_norm in zip(keywords, vols):
         rel = fuzz.token_set_ratio(p, k.keyword.lower()) / 100.0
-        score = (w_relevance * rel) + (w_volume * v_norm) + (w_ctr * c_norm)
+        score = (w_relevance * rel) + (w_volume * v_norm)
         scored.append((k, score, rel))
     scored.sort(key=lambda x: x[1], reverse=True)
     return scored[:top_k]
@@ -182,7 +178,7 @@ def optimize_nappe_title(
     ranked = rank_keywords_for_product(product_text, keywords, top_k=6)
 
     candidates = [
-        {"keyword": k.keyword, "volume": k.volume, "ctr": k.ctr, "relevance": round(rel, 3), "score": round(score, 3)}
+        {"keyword": k.keyword, "volume": k.volume, "relevance": round(rel, 3), "score": round(score, 3)}
         for (k, score, rel) in ranked
     ]
 
@@ -212,7 +208,7 @@ Title actuel:
 Description:
 {description}
 
-Mots-clés candidats (Volume/CTR + score de pertinence):
+Mots-clés candidats (Volume + score de pertinence):
 {candidates}
 
 Contraintes strictes:
@@ -257,7 +253,7 @@ Rends:
 # STREAMLIT UI
 # =========================
 st.set_page_config(page_title="GMC Title Optimizer (Nappes)", layout="wide")
-st.title("Optimisation Titles GMC — Verticale Nappes (Garnier-Thiebaut)")
+st.title("Optimisation Titles GMC — Verticale Nappes (sans CTR)")
 
 # secrets -> env
 if "OPENAI_API_KEY" in st.secrets:
@@ -273,11 +269,10 @@ with st.sidebar:
     brand = st.text_input("Marque", BRAND_DEFAULT)
     model = st.selectbox("Modèle", ["gpt-5-mini", "gpt-4o-mini"], index=0)
     n_rows = st.slider("Nombre de lignes à traiter (démo)", 1, 200, 10)
-    st.caption("Astuce: commence par 10, puis augmente.")
 
 st.subheader("1) Import des données")
 prod_file = st.file_uploader("Produits (CSV/XLSX) — colonnes: title, description", type=["csv", "xlsx"])
-kw_file = st.file_uploader("Mots-clés Nappes (CSV/XLSX) — colonnes: keyword, volume, ctr", type=["csv", "xlsx"])
+kw_file = st.file_uploader("Mots-clés Nappes (CSV/XLSX) — colonnes: keyword, volume", type=["csv", "xlsx"])
 
 if not prod_file or not kw_file:
     st.info("Importe les 2 fichiers pour lancer l’optimisation.")
@@ -295,29 +290,21 @@ col_desc = st.selectbox("Colonne Description (produits)", df_prod.columns, index
 
 col_kw = st.selectbox("Colonne Keyword", df_kw.columns, index=list(df_kw.columns).index("keyword") if "keyword" in df_kw.columns else 0)
 col_vol = st.selectbox("Colonne Volume", df_kw.columns, index=list(df_kw.columns).index("volume") if "volume" in df_kw.columns else 0)
-col_ctr = st.selectbox("Colonne CTR", df_kw.columns, index=list(df_kw.columns).index("ctr") if "ctr" in df_kw.columns else 0)
 
 keywords: List[KeywordRow] = []
 for _, r in df_kw.iterrows():
     k = str(r[col_kw]).strip()
     if not k or k.lower() == "nan":
         continue
-    keywords.append(
-        KeywordRow(
-            keyword=k,
-            volume=as_float(r[col_vol], 0.0),
-            ctr=as_float(r[col_ctr], 0.0),
-        )
-    )
+    keywords.append(KeywordRow(keyword=k, volume=as_float(r[col_vol], 0.0)))
 
 st.subheader("3) Optimisation")
 if st.button("Optimiser les titles (Nappes)"):
     df = df_prod.head(n_rows).copy()
-
     results = []
     prog = st.progress(0)
 
-    for idx, row in df.iterrows():
+    for _, row in df.iterrows():
         cur_title = str(row[col_title]) if pd.notna(row[col_title]) else ""
         desc = str(row[col_desc]) if pd.notna(row[col_desc]) else ""
 
