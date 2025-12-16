@@ -57,10 +57,10 @@ def as_float(x, default=0.0) -> float:
     except Exception:
         return default
 
-def df_to_xlsx_bytes(df: pd.DataFrame, sheet_name: str = "nappes") -> bytes:
+def df_to_xlsx_bytes(df: pd.DataFrame, sheet_name: str = "sheet") -> bytes:
     output = BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False, sheet_name=sheet_name)
+        df.to_excel(writer, index=False, sheet_name=sheet_name[:31])
     return output.getvalue()
 
 # =========================
@@ -76,28 +76,19 @@ def strip_accents(s: str) -> str:
 
 def normalize_separators(s: str) -> str:
     """
-    Normalise uniquement les séparateurs entre blocs (ex: " - "), SANS casser les tirets internes.
-    -> "Garnier-Thiebaut" reste "Garnier-Thiebaut"
+    Normalise uniquement les séparateurs entre blocs (" - "), sans casser les tirets internes.
+    Ex: "Garnier-Thiebaut" reste "Garnier-Thiebaut"
     """
     if not s:
         return ""
     s = s.replace("–", "-").replace("—", "-")
     s = re.sub(r"\s+", " ", s).strip()
-
-    # Convertit des séparateurs alternatifs en " - "
-    s = re.sub(r"\s*[|,]\s*", " - ", s)
-
-    # Normalise uniquement les tirets avec espaces autour: " a - b " => " a - b "
-    s = re.sub(r"\s+-\s+", " - ", s)
-
-    # Collapsing des répétitions " -  -  - "
-    s = re.sub(r"(?:\s-\s){2,}", " - ", s)
-
-    # Nettoie " - " en début/fin
+    s = re.sub(r"\s*[|,]\s*", " - ", s)       # | et , deviennent " - "
+    s = re.sub(r"\s+-\s+", " - ", s)          # normalise les " - "
+    s = re.sub(r"(?:\s-\s){2,}", " - ", s)    # collapse " - - - "
     s = s.strip()
     s = re.sub(r"^(?:-\s*)+", "", s).strip()
     s = re.sub(r"(?:\s*-\s*)+$", "", s).strip()
-
     return s
 
 def has_made_in_france(description: str) -> bool:
@@ -127,20 +118,16 @@ def brand_variant_regex(brand: str) -> re.Pattern:
     if not tokens:
         return re.compile(re.escape(brand), re.IGNORECASE)
 
-    joiner = r"(?:\s*[-–—]\s*|\s+)"  # hyphen avec/sans espaces, ou espace
+    joiner = r"(?:\s*[-–—]\s*|\s+)"
     pattern = r"\b" + joiner.join(map(re.escape, tokens)) + r"\b"
     return re.compile(pattern, re.IGNORECASE)
 
 def remove_brand_occurrences(text: str, brand: str) -> str:
-    """
-    Retire TOUTES les occurrences de la marque (toutes variantes), puis nettoie les séparateurs.
-    """
     t = normalize_separators(text)
     pat = brand_variant_regex(brand)
     t = pat.sub(" ", t)
     t = normalize_separators(t)
-    t = t.strip(" -|,")
-    return t
+    return t.strip(" -|,")
 
 # =========================
 # KEYWORD SCORING
@@ -164,12 +151,10 @@ def rank_keywords_for_product(
     vols = _minmax([k.volume for k in keywords])
     scored = []
     p = (product_text or "").lower()
-
     for k, v_norm in zip(keywords, vols):
         rel = fuzz.token_set_ratio(p, k.keyword.lower()) / 100.0
         score = (w_relevance * rel) + (w_volume * v_norm)
         scored.append((k, score, rel))
-
     scored.sort(key=lambda x: x[1], reverse=True)
     return scored[:top_k]
 
@@ -177,12 +162,6 @@ def rank_keywords_for_product(
 # TITLE CASE ("Camel case visuel")
 # =========================
 def smart_title_case(title: str, brand: str) -> str:
-    """
-    Nappe Coton Mélangé Antitache...
-    - conserve dimensions, unités, acronymes
-    - conserve la marque (format canonical) inchangée
-    - force "Made in France" (in minuscule)
-    """
     t = normalize_separators(title)
 
     placeholder = "__BRAND__"
@@ -208,21 +187,17 @@ def smart_title_case(title: str, brand: str) -> str:
             return tok
         if tok == placeholder:
             return placeholder
-
         if is_dimension(tok) or is_measure(tok) or is_percent(tok) or is_acronym(tok):
             return tok
 
         low = tok.lower()
-
         if (low in STOPWORDS_FR) and not is_first:
             return low
 
-        # d'/l'
         if re.fullmatch(r"[dl]'[a-zàâçéèêëîïôûùüÿñæœ].+", low):
             prefix, rest = tok.split("'", 1)
             return prefix.lower() + "'" + cap_word(rest)
 
-        # mot composé (ANTI-TACHE => Anti-Tache)
         if "-" in tok:
             parts = tok.split("-")
             outp = []
@@ -243,6 +218,7 @@ def smart_title_case(title: str, brand: str) -> str:
     out = [transform_token(tok, is_first=(i == 0)) for i, tok in enumerate(tokens)]
     t2 = " ".join(out)
 
+    # Force "Made in France"
     t2 = re.sub(r"\bMade\s+In\s+France\b", "Made in France", t2)
     t2 = re.sub(r"\bMade\s+in\s+France\b", "Made in France", t2)
 
@@ -258,7 +234,6 @@ def truncate_preserve_suffix(main: str, suffix: str, max_len: int) -> str:
 
     if not suffix:
         return main[:max_len].rstrip()
-
     if len(suffix) >= max_len:
         return suffix[:max_len].rstrip()
 
@@ -266,32 +241,26 @@ def truncate_preserve_suffix(main: str, suffix: str, max_len: int) -> str:
     return (main[:allowed].rstrip() + suffix).rstrip()
 
 def enforce_basic_rules(title: str, brand: str, made_in_france: bool, max_len: int = MAX_TITLE_LEN) -> str:
-    """
-    GARANTIES:
-    - Marque supprimée partout (toutes variantes)
-    - Made in France supprimé puis ré-ajouté si nécessaire
-    - Préfixe "Nappe"
-    - Suffix final:
-        - " - Made in France - Garnier-Thiebaut" si détecté
-        - sinon " - Garnier-Thiebaut"
-    - Longueur <= 150 en préservant le suffix
-    - Title case final
-    """
+    # 1) nettoyage du corps
     t = normalize_separators(title)
-
-    # purge marque + made in france partout dans le corps
     t = remove_brand_occurrences(t, brand)
     t = remove_made_in_france(t)
 
+    # 2) prefixe Nappe
     if t and not t.lower().startswith("nappe"):
         t = "Nappe " + t
     t = normalize_separators(t).strip(" -")
 
+    # 3) suffix unique final (canonical)
     suffix = f" - Made in France - {brand}" if made_in_france else f" - {brand}"
+
+    # 4) tronque en préservant suffix
     t = truncate_preserve_suffix(t, suffix, max_len)
+
+    # 5) camel case visuel
     t = smart_title_case(t, brand)
 
-    # hard final (au cas où le casing / nettoyage réintroduit des variantes)
+    # 6) hard-recheck (au cas où)
     t_main = remove_brand_occurrences(t, brand)
     t_main = remove_made_in_france(t_main)
     if t_main and not t_main.lower().startswith("nappe"):
@@ -299,14 +268,11 @@ def enforce_basic_rules(title: str, brand: str, made_in_france: bool, max_len: i
     t_main = normalize_separators(t_main).strip(" -")
     t = truncate_preserve_suffix(t_main, suffix, max_len)
     t = smart_title_case(t, brand)
-    t = t[:max_len].rstrip()
-
-    return t
+    return t[:max_len].rstrip()
 
 def validate_title(title: str, brand: str) -> List[str]:
     issues = []
     t = normalize_separators(title).strip()
-
     if not t:
         return ["title vide"]
     if len(t) > MAX_TITLE_LEN:
@@ -317,12 +283,9 @@ def validate_title(title: str, brand: str) -> List[str]:
     pat = brand_variant_regex(brand)
     occ = list(pat.finditer(t))
     if len(occ) != 1:
-        issues.append("marque != 1 occurrence (variante incluse)")
+        issues.append("marque != 1 occurrence (toutes variantes)")
     if not t.endswith(brand):
-        issues.append("marque pas au format canonical en fin (doit finir par 'Garnier-Thiebaut')")
-
-    if re.search(r"\bpromo\b|\bréduc\b|\breduction\b|%|€", t.lower()):
-        issues.append("contient promo/prix")
+        issues.append("marque pas en fin au format canonical")
 
     return issues
 
@@ -331,8 +294,7 @@ def added_terms(old: str, new: str) -> List[str]:
         s = re.sub(r"[^\w\s\-×x]", " ", (s or "").lower())
         return {w for w in s.split() if len(w) > 2 and w not in STOPWORDS_FR}
     o, n = tok(old), tok(new)
-    add = sorted(list(n - o))
-    return add[:12]
+    return sorted(list(n - o))[:12]
 
 # =========================
 # OPENAI HELPERS
@@ -358,7 +320,6 @@ def openai_list_models(api_key: str) -> List[str]:
         except Exception:
             msg = r.text
         raise RuntimeError(f"List models failed HTTP {r.status_code}: {msg}")
-
     j = r.json()
     return sorted([m["id"] for m in j.get("data", []) if "id" in m])
 
@@ -440,7 +401,6 @@ def optimize_nappe_title(
 ) -> Dict[str, Any]:
     current_title = (current_title or "")[:220]
     description = (description or "")[:1500]
-
     made_in_fr = has_made_in_france(description)
 
     product_text = f"{current_title}\n{description}".strip()
@@ -529,7 +489,6 @@ Rends:
         time.sleep(per_call_sleep_s)
 
     return {
-        "source_row_index": None,
         "title_current": current_title,
         "description_has_made_in_france": "Oui" if made_in_fr else "Non",
         "title_optimized": opt,
@@ -544,7 +503,7 @@ Rends:
 # STREAMLIT UI
 # =========================
 st.set_page_config(page_title="GMC Title Optimizer (Nappes)", layout="wide")
-st.title("Optimisation Titles GMC — Nappes (keyword + volume) → export Excel")
+st.title("GMC Title Optimizer — Nappes (Split en lots + export Excel)")
 
 if "OPENAI_API_KEY" in st.secrets:
     os.environ["OPENAI_API_KEY"] = st.secrets["OPENAI_API_KEY"]
@@ -559,7 +518,7 @@ with st.sidebar:
     brand = st.text_input("Marque (canonical)", BRAND_DEFAULT)
     model = st.selectbox("Modèle", ["gpt-4o-mini", "gpt-5-mini"], index=0)
     per_call_sleep_s = st.slider("Pause entre appels API (sec)", 0.0, 2.0, 0.2, 0.1)
-    st.caption("Augmente si tu as des 429 (rate limit).")
+    st.caption("Astuce stabilité: laisse 0.2–0.5s si tu as des 429.")
 
     if st.button("Tester la clé + lister les modèles"):
         try:
@@ -576,7 +535,7 @@ prod_file = st.file_uploader("Produits (CSV/XLSX) — colonnes: title, descripti
 kw_file = st.file_uploader("Mots-clés Nappes (CSV/XLSX) — colonnes: keyword, volume", type=["csv", "xlsx"])
 
 if not prod_file or not kw_file:
-    st.info("Importe les 2 fichiers pour lancer l’optimisation.")
+    st.info("Importe les 2 fichiers pour activer le split + l’optimisation par lots.")
     st.stop()
 
 df_prod = read_any(prod_file)
@@ -619,35 +578,60 @@ if not keywords:
     st.error("Aucun mot-clé valide détecté (vérifie les colonnes keyword/volume).")
     st.stop()
 
-st.subheader("3) Traitement (batch / au-delà de la démo)")
+# =========================
+# 3) SPLIT EN LOTS (200)
+# =========================
+st.subheader("3) Split du fichier produits en lots (ex: 200 lignes) + liens de téléchargement")
+
 total_rows = len(df_prod)
-c1, c2, c3 = st.columns([1, 1, 2])
-with c1:
-    start_index = st.number_input("Index de départ (0 = 1ère ligne)", min_value=0, max_value=max(0, total_rows - 1), value=0, step=1)
-with c2:
-    treat_all = st.checkbox("Traiter toutes les lignes (à partir de l’index)", value=False)
-with c3:
-    if treat_all:
-        n_rows = total_rows - int(start_index)
-        st.write(f"Traitement prévu : **{n_rows}** ligne(s) (sur {total_rows})")
-    else:
-        n_rows = st.number_input("Nombre de lignes à traiter", min_value=1, max_value=max(1, total_rows - int(start_index)), value=min(200, max(1, total_rows - int(start_index))), step=1)
+chunk_size = st.number_input("Taille d’un lot (lignes)", min_value=50, max_value=2000, value=200, step=50)
+num_chunks = int(math.ceil(total_rows / int(chunk_size)))
 
-if st.button("Optimiser les titles (Nappes)"):
-    start_index = int(start_index)
-    n_rows = int(n_rows)
-    end_index = min(total_rows, start_index + n_rows)
+st.write(f"Produits: **{total_rows}** lignes → **{num_chunks}** lot(s) de ~{int(chunk_size)} lignes")
 
+chunk_index = st.selectbox("Choisir un lot", list(range(num_chunks)), format_func=lambda i: f"Lot {i+1}/{num_chunks}")
+start = int(chunk_index) * int(chunk_size)
+end = min(total_rows, start + int(chunk_size))
+st.caption(f"Lignes incluses: index {start} → {end-1} (soit {end-start} lignes)")
+
+df_chunk = df_prod.iloc[start:end].copy()
+
+colA, colB = st.columns([1, 1])
+with colA:
+    # Lien de téléchargement du lot d'entrée (stable, sans API)
+    in_bytes = df_to_xlsx_bytes(df_chunk, sheet_name=f"input_{chunk_index+1}")
+    st.download_button(
+        f"Télécharger le lot d’entrée (Excel) — lot {chunk_index+1}",
+        data=in_bytes,
+        file_name=f"products_chunk_{chunk_index+1}_rows_{start}_{end-1}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        key=f"dl_input_{chunk_index}"
+    )
+
+with colB:
+    st.write("")
+
+# =========================
+# 4) OPTIMISER UN LOT
+# =========================
+st.subheader("4) Optimiser uniquement ce lot (recommandé pour la stabilité)")
+
+if "optimized_chunks" not in st.session_state:
+    st.session_state.optimized_chunks = {}  # key -> xlsx bytes
+
+run_opt = st.button(f"Optimiser le lot {chunk_index+1} ({end-start} lignes)")
+
+if run_opt:
     results = []
     prog = st.progress(0)
     status = st.empty()
 
-    for pos, i in enumerate(range(start_index, end_index), start=1):
+    for pos, i in enumerate(range(start, end), start=1):
         row = df_prod.iloc[i]
         cur_title = str(row[col_title]) if pd.notna(row[col_title]) else ""
         desc = str(row[col_desc]) if pd.notna(row[col_desc]) else ""
 
-        status.write(f"Ligne {i} ({pos}/{end_index-start_index}) …")
+        status.write(f"Ligne {i} ({pos}/{end-start}) …")
 
         try:
             out = optimize_nappe_title(
@@ -674,16 +658,21 @@ if st.button("Optimiser les titles (Nappes)"):
                 "keyword_candidates": "",
             })
 
-        prog.progress(min(1.0, pos / max(1, (end_index - start_index))))
+        prog.progress(min(1.0, pos / max(1, (end - start))))
 
     res_df = pd.DataFrame(results)
-    st.success("Terminé ✅")
+    st.success("Lot terminé ✅")
     st.dataframe(res_df, use_container_width=True)
 
-    xlsx_bytes = df_to_xlsx_bytes(res_df, sheet_name="nappes")
+    out_bytes = df_to_xlsx_bytes(res_df, sheet_name=f"out_{chunk_index+1}")
+    st.session_state.optimized_chunks[chunk_index] = out_bytes
+
+# Lien de téléchargement du résultat si dispo en session
+if chunk_index in st.session_state.optimized_chunks:
     st.download_button(
-        "Télécharger le résultat (Excel .xlsx)",
-        data=xlsx_bytes,
-        file_name=f"gmc_titles_nappes_optimized_{start_index}_{end_index-1}.xlsx",
+        f"Télécharger le résultat optimisé (Excel) — lot {chunk_index+1}",
+        data=st.session_state.optimized_chunks[chunk_index],
+        file_name=f"gmc_titles_optimized_chunk_{chunk_index+1}_rows_{start}_{end-1}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        key=f"dl_output_{chunk_index}"
     )
