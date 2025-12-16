@@ -21,8 +21,8 @@ VERTICAL_DEFAULT = "Nappes"
 MAX_TITLE_LEN = 150
 
 STOPWORDS_FR = {
-    "de", "la", "le", "les", "des", "du", "d", "et", "a", "à", "en",
-    "pour", "avec", "sur", "dans", "au", "aux", "un", "une", "the", "of", "in"
+    "de","la","le","les","des","du","d","et","a","à","en","pour","avec","sur","dans",
+    "au","aux","un","une","the","of","in"
 }
 
 # =========================
@@ -34,7 +34,7 @@ class KeywordRow:
     volume: float
 
 # =========================
-# FILE READERS
+# FILE READERS / WRITERS
 # =========================
 def read_any(file) -> pd.DataFrame:
     """
@@ -79,21 +79,19 @@ def strip_accents(s: str) -> str:
     )
 
 def has_made_in_france(description: str) -> bool:
-    """
-    Détecte 'Fabriqué en France' même avec accents/typos, + quelques variantes.
-    """
     d = strip_accents((description or "")).lower()
     d = re.sub(r"\s+", " ", d).strip()
+    return (
+        "fabrique en france" in d
+        or "fabriquee en france" in d
+        or "made in france" in d
+        or "fabrication francaise" in d
+    )
 
-    patterns = [
-        r"fabrique en france",
-        r"fabriquee en france",
-        r"fabriqu[eé] en france",  # au cas où accents restent
-        r"made in france",
-        r"fabrication francaise",
-        r"fabrique a?u?x? france",  # tolérance ultra large
-    ]
-    return any(re.search(p, d) for p in patterns)
+def normalize_spaces(s: str) -> str:
+    s = re.sub(r"\s+", " ", (s or "")).strip()
+    s = re.sub(r"\s*-\s*", " - ", s)
+    return s
 
 # =========================
 # KEYWORD SCORING
@@ -127,81 +125,94 @@ def rank_keywords_for_product(
     return scored[:top_k]
 
 # =========================
-# TITLE FORMATTING / QA
+# TITLE CASE ("Camel case visuel")
 # =========================
-def normalize_spaces(s: str) -> str:
-    s = re.sub(r"\s+", " ", (s or "")).strip()
-    s = re.sub(r"\s*-\s*", " - ", s)  # uniformise séparateurs
-    return s
-
 def smart_title_case(title: str, brand: str) -> str:
     """
-    "Camel Case" version e-commerce : majuscule initiale des mots importants.
-    Conserve dimensions, % et la marque.
+    Capitalise les mots "importants" : Nappe Coton Mélangé Antitache...
+    Conserve dimensions (160x250), unités (60cm), % et acronymes (OEKO-TEX).
+    Conserve la marque inchangée.
+    Force "Made in France" avec 'in' en minuscule.
     """
     t = normalize_spaces(title)
 
-    # Protéger marque
+    # protège la marque
     placeholder = "__BRAND__"
-    t_protected = t.replace(brand, placeholder)
+    t = t.replace(brand, placeholder)
 
-    def transform_token(tok: str) -> str:
+    def is_dimension(tok: str) -> bool:
+        return bool(re.fullmatch(r"\d+([x×]\d+)+", tok.lower()))
+
+    def is_measure(tok: str) -> bool:
+        return bool(re.fullmatch(r"\d+(cm|mm|m)", tok.lower()))
+
+    def is_percent(tok: str) -> bool:
+        return bool(re.fullmatch(r"\d+(\.\d+)?%", tok))
+
+    def is_acronym(tok: str) -> bool:
+        return bool(re.fullmatch(r"[A-Z0-9]{2,}([\-][A-Z0-9]{2,})*", tok))
+
+    def cap_word(w: str) -> str:
+        if not w:
+            return w
+        return w[0].upper() + w[1:].lower()
+
+    def transform_token(tok: str, is_first: bool) -> str:
         if not tok:
+            return tok
+        if tok == placeholder:
+            return placeholder
+
+        if is_dimension(tok) or is_measure(tok) or is_percent(tok) or is_acronym(tok):
             return tok
 
         low = tok.lower()
 
-        # keep common measurement patterns / numbers
-        if re.match(r"^\d+([x×]\d+)+$", tok.lower()):
-            return tok
-        if re.match(r"^\d+(cm|mm|m)$", low):
-            return low  # "cm" plutôt en minuscule
-        if re.match(r"^\d+(\.\d+)?%$", tok):
-            return tok
-        if low in STOPWORDS_FR:
+        # stopwords en minuscule sauf 1er mot
+        if (low in STOPWORDS_FR) and not is_first:
             return low
 
-        # mots avec apostrophe : d' / l'
-        if re.match(r"^[dl]'[a-zàâçéèêëîïôûùüÿñæœ].+", tok.lower()):
+        # apostrophes: d' / l'
+        if re.fullmatch(r"[dl]'[a-zàâçéèêëîïôûùüÿñæœ].+", low):
             prefix, rest = tok.split("'", 1)
-            return prefix.lower() + "'" + (rest[:1].upper() + rest[1:].lower())
+            return prefix.lower() + "'" + cap_word(rest)
 
-        # hyphen words : "anti-tache", "garnier-thiebaut" etc.
+        # mots composés : anti-tache -> Anti-Tache
         if "-" in tok:
             parts = tok.split("-")
-            parts2 = []
+            new_parts = []
             for p in parts:
                 if not p:
-                    parts2.append(p)
+                    new_parts.append(p)
+                    continue
+                lp = p.lower()
+                if (lp in STOPWORDS_FR) and not is_first:
+                    new_parts.append(lp)
                 else:
-                    lp = p.lower()
-                    if lp in STOPWORDS_FR:
-                        parts2.append(lp)
-                    else:
-                        parts2.append(lp[:1].upper() + lp[1:])
-            return "-".join(parts2)
+                    new_parts.append(cap_word(p))
+            return "-".join(new_parts)
 
-        return low[:1].upper() + low[1:]
+        return cap_word(tok)
 
-    tokens = t_protected.split(" ")
-    # premier mot toujours capitalisé
+    tokens = t.split(" ")
     out = []
     for i, tok in enumerate(tokens):
-        if i == 0:
-            out.append(tok[:1].upper() + tok[1:].lower() if tok else tok)
-        else:
-            out.append(transform_token(tok))
+        out.append(transform_token(tok, is_first=(i == 0)))
 
-    t2 = " ".join(out).replace(placeholder, brand)
+    t2 = " ".join(out)
 
-    # Phrase fixe exigée
-    t2 = re.sub(r"\bMade In France\b", "Made in France", t2)
+    # Force "Made in France"
+    t2 = re.sub(r"\bMade\s+In\s+France\b", "Made in France", t2)
+    t2 = re.sub(r"\bMade\s+in\s+France\b", "Made in France", t2)
+
+    # restaure la marque
+    t2 = t2.replace(placeholder, brand)
     return normalize_spaces(t2)
 
+# =========================
+# TITLE RULES (brand + made in france + max len)
+# =========================
 def truncate_preserve_suffix(main: str, suffix: str, max_len: int) -> str:
-    """
-    Tronque main pour que (main + suffix) <= max_len, en préservant suffix.
-    """
     main = (main or "").rstrip()
     suffix = (suffix or "").lstrip()
 
@@ -212,74 +223,40 @@ def truncate_preserve_suffix(main: str, suffix: str, max_len: int) -> str:
         return suffix[:max_len].rstrip()
 
     allowed = max_len - len(suffix)
-    main_cut = main[:allowed].rstrip()
-    return (main_cut + suffix).rstrip()
+    return (main[:allowed].rstrip() + suffix).rstrip()
 
 def ensure_brand_suffix(title: str, brand: str) -> str:
-    """
-    Assure que le title termine par " - {brand}" et que la marque n'apparait qu'une fois.
-    """
     t = normalize_spaces(title)
-
-    # Supprime occurrences multiples de la marque (simple)
-    # On retire toutes occurrences puis on la remet en fin
+    # retire toutes occurrences de la marque puis remet en fin
     t_wo_brand = re.sub(re.escape(brand), "", t, flags=re.IGNORECASE)
     t_wo_brand = normalize_spaces(t_wo_brand).strip(" -")
+    return (t_wo_brand + f" - {brand}").strip()
 
-    suffix = f" - {brand}"
-    if not t_wo_brand:
-        return f"{brand}"[:MAX_TITLE_LEN]
-
-    return (t_wo_brand + suffix).strip()
-
-def add_made_in_france_if_needed(title: str, brand: str, should_add: bool) -> str:
-    """
-    Ajoute 'Made in France' avant la marque si should_add=True.
-    Gère déduplication et conservation fin de title.
-    """
-    t = normalize_spaces(title)
-
-    # retire toute occurrence existante
-    t = re.sub(r"\bmade\s+in\s+france\b", "", t, flags=re.IGNORECASE)
-    t = normalize_spaces(t).strip(" -")
-
-    # assure marque en fin d'abord
-    t = ensure_brand_suffix(t, brand)
-
-    if not should_add:
-        return t
-
-    suffix_brand = f" - {brand}"
-    if t.endswith(suffix_brand):
-        main = t[:-len(suffix_brand)].rstrip()
-        # évite double tirets
-        main = main.strip(" -")
-        new_suffix = f" - Made in France - {brand}"
-        # tronque en préservant suffix
-        return truncate_preserve_suffix(main, new_suffix, MAX_TITLE_LEN)
-
-    # fallback
-    t2 = f"{t} - Made in France"
-    return truncate_preserve_suffix(t2, "", MAX_TITLE_LEN)
-
-def enforce_basic_rules(title: str, brand: str, made_in_france: bool) -> str:
+def enforce_basic_rules(title: str, brand: str, made_in_france: bool, max_len: int = MAX_TITLE_LEN) -> str:
     t = normalize_spaces(title)
 
     # doit commencer par "Nappe"
     if t and not t.lower().startswith("nappe"):
         t = "Nappe " + t
 
-    # marque en fin + made in france
-    t = add_made_in_france_if_needed(t, brand, made_in_france)
+    # marque en fin
+    t = ensure_brand_suffix(t, brand)
 
-    # limite 150 (préservée via truncate_preserve_suffix dans made_in_france path, mais re-sécurise)
-    t = t[:MAX_TITLE_LEN].rstrip()
+    # ajoute Made in France avant marque si nécessaire
+    if made_in_france:
+        suffix_brand = f" - {brand}"
+        if t.endswith(suffix_brand):
+            main = t[:-len(suffix_brand)].strip(" -")
+            suffix = f" - Made in France - {brand}"
+            t = truncate_preserve_suffix(main, suffix, max_len)
+        else:
+            t = truncate_preserve_suffix(t, "", max_len)
 
-    # title case (camel-ish)
+    # Camel case visuel
     t = smart_title_case(t, brand)
 
-    # re-sécurise longueur après casing
-    t = t[:MAX_TITLE_LEN].rstrip()
+    # sécurité max len
+    t = t[:max_len].rstrip()
     return t
 
 def validate_title(title: str, brand: str) -> List[str]:
@@ -448,6 +425,10 @@ Contraintes strictes:
 - Pas de promo, pas de prix, pas de superlatifs gratuits.
 - Marque une seule fois, de préférence en fin (ex: "- {brand}").
 - Longueur max: {MAX_TITLE_LEN} caractères.
+Rends:
+- optimized_title
+- used_keywords (0 à 2)
+- notes (1 phrase)
 """.strip()
 
     try:
@@ -475,13 +456,13 @@ Contraintes strictes:
         else:
             raise
 
-    opt = enforce_basic_rules(out["optimized_title"], brand, made_in_fr)
+    opt = enforce_basic_rules(out["optimized_title"], brand, made_in_fr, max_len=MAX_TITLE_LEN)
     issues = validate_title(opt, brand)
     adds = added_terms(current_title, opt)
 
     return {
         "title_current": current_title,
-        "description_has_fabrique_france": "Oui" if made_in_fr else "Non",
+        "description_has_made_in_france": "Oui" if made_in_fr else "Non",
         "title_optimized": opt,
         "added_terms": " | ".join(adds),
         "used_keywords": " | ".join(out.get("used_keywords", [])),
@@ -494,7 +475,7 @@ Contraintes strictes:
 # STREAMLIT UI
 # =========================
 st.set_page_config(page_title="GMC Title Optimizer (Nappes)", layout="wide")
-st.title("Optimisation Titles GMC — Nappes (keyword + volume) → export Excel")
+st.title("Optimisation Titles GMC — Nappes (keyword + volume) → export Excel (.xlsx)")
 
 # secrets -> env
 if "OPENAI_API_KEY" in st.secrets:
@@ -578,7 +559,6 @@ if not keywords:
 st.subheader("3) Optimisation + Export Excel")
 if st.button("Optimiser les titles (Nappes)"):
     df = df_prod.head(n_rows).copy()
-
     results = []
     prog = st.progress(0)
 
@@ -599,7 +579,7 @@ if st.button("Optimiser les titles (Nappes)"):
         except Exception as e:
             results.append({
                 "title_current": cur_title,
-                "description_has_fabrique_france": "",
+                "description_has_made_in_france": "",
                 "title_optimized": "",
                 "added_terms": "",
                 "used_keywords": "",
@@ -614,7 +594,6 @@ if st.button("Optimiser les titles (Nappes)"):
     st.success("Terminé ✅")
     st.dataframe(res_df, use_container_width=True)
 
-    # Export XLSX
     xlsx_bytes = df_to_xlsx_bytes(res_df, sheet_name="nappes")
     st.download_button(
         "Télécharger le résultat (Excel .xlsx)",
