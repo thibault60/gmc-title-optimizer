@@ -2,6 +2,7 @@ import os
 import json
 import math
 import re
+import time
 import unicodedata
 from dataclasses import dataclass
 from typing import Any, Dict, List, Tuple
@@ -37,11 +38,6 @@ class KeywordRow:
 # FILE READERS / WRITERS
 # =========================
 def read_any(file) -> pd.DataFrame:
-    """
-    Supporte CSV et XLSX.
-    - CSV: essaie ',' puis ';'
-    - XLSX: nécessite openpyxl
-    """
     name = file.name.lower()
     if name.endswith(".csv"):
         try:
@@ -78,6 +74,11 @@ def strip_accents(s: str) -> str:
         if not unicodedata.combining(c)
     )
 
+def normalize_spaces(s: str) -> str:
+    s = re.sub(r"\s+", " ", (s or "")).strip()
+    s = re.sub(r"\s*-\s*", " - ", s)
+    return s
+
 def has_made_in_france(description: str) -> bool:
     d = strip_accents((description or "")).lower()
     d = re.sub(r"\s+", " ", d).strip()
@@ -87,11 +88,6 @@ def has_made_in_france(description: str) -> bool:
         or "made in france" in d
         or "fabrication francaise" in d
     )
-
-def normalize_spaces(s: str) -> str:
-    s = re.sub(r"\s+", " ", (s or "")).strip()
-    s = re.sub(r"\s*-\s*", " - ", s)
-    return s
 
 # =========================
 # KEYWORD SCORING
@@ -128,12 +124,6 @@ def rank_keywords_for_product(
 # TITLE CASE ("Camel case visuel")
 # =========================
 def smart_title_case(title: str, brand: str) -> str:
-    """
-    Capitalise les mots "importants" : Nappe Coton Mélangé Antitache...
-    Conserve dimensions (160x250), unités (60cm), % et acronymes (OEKO-TEX).
-    Conserve la marque inchangée.
-    Force "Made in France" avec 'in' en minuscule.
-    """
     t = normalize_spaces(title)
 
     # protège la marque
@@ -153,9 +143,7 @@ def smart_title_case(title: str, brand: str) -> str:
         return bool(re.fullmatch(r"[A-Z0-9]{2,}([\-][A-Z0-9]{2,})*", tok))
 
     def cap_word(w: str) -> str:
-        if not w:
-            return w
-        return w[0].upper() + w[1:].lower()
+        return w[:1].upper() + w[1:].lower() if w else w
 
     def transform_token(tok: str, is_first: bool) -> str:
         if not tok:
@@ -172,36 +160,33 @@ def smart_title_case(title: str, brand: str) -> str:
         if (low in STOPWORDS_FR) and not is_first:
             return low
 
-        # apostrophes: d' / l'
+        # apostrophes : d' / l'
         if re.fullmatch(r"[dl]'[a-zàâçéèêëîïôûùüÿñæœ].+", low):
             prefix, rest = tok.split("'", 1)
             return prefix.lower() + "'" + cap_word(rest)
 
-        # mots composés : anti-tache -> Anti-Tache
+        # mots composés
         if "-" in tok:
             parts = tok.split("-")
-            new_parts = []
+            outp = []
             for p in parts:
                 if not p:
-                    new_parts.append(p)
+                    outp.append(p)
                     continue
                 lp = p.lower()
                 if (lp in STOPWORDS_FR) and not is_first:
-                    new_parts.append(lp)
+                    outp.append(lp)
                 else:
-                    new_parts.append(cap_word(p))
-            return "-".join(new_parts)
+                    outp.append(cap_word(p))
+            return "-".join(outp)
 
         return cap_word(tok)
 
     tokens = t.split(" ")
-    out = []
-    for i, tok in enumerate(tokens):
-        out.append(transform_token(tok, is_first=(i == 0)))
-
+    out = [transform_token(tok, is_first=(i == 0)) for i, tok in enumerate(tokens)]
     t2 = " ".join(out)
 
-    # Force "Made in France"
+    # force "Made in France"
     t2 = re.sub(r"\bMade\s+In\s+France\b", "Made in France", t2)
     t2 = re.sub(r"\bMade\s+in\s+France\b", "Made in France", t2)
 
@@ -210,8 +195,18 @@ def smart_title_case(title: str, brand: str) -> str:
     return normalize_spaces(t2)
 
 # =========================
-# TITLE RULES (brand + made in france + max len)
+# BRAND / SUFFIX ENFORCEMENT
 # =========================
+def remove_brand_occurrences(text: str, brand: str) -> str:
+    """
+    Retire la marque où qu'elle apparaisse (avec ou sans séparateurs), en restant tolérant.
+    """
+    t = normalize_spaces(text)
+    # retire " - Brand" / "Brand" / ", Brand" / "| Brand" etc.
+    pattern = re.compile(rf"(\s*[-–—|,]?\s*)\b{re.escape(brand)}\b", re.IGNORECASE)
+    t = pattern.sub(" ", t)
+    return normalize_spaces(t).strip(" -|,")
+
 def truncate_preserve_suffix(main: str, suffix: str, max_len: int) -> str:
     main = (main or "").rstrip()
     suffix = (suffix or "").lstrip()
@@ -225,38 +220,47 @@ def truncate_preserve_suffix(main: str, suffix: str, max_len: int) -> str:
     allowed = max_len - len(suffix)
     return (main[:allowed].rstrip() + suffix).rstrip()
 
-def ensure_brand_suffix(title: str, brand: str) -> str:
-    t = normalize_spaces(title)
-    # retire toutes occurrences de la marque puis remet en fin
-    t_wo_brand = re.sub(re.escape(brand), "", t, flags=re.IGNORECASE)
-    t_wo_brand = normalize_spaces(t_wo_brand).strip(" -")
-    return (t_wo_brand + f" - {brand}").strip()
-
 def enforce_basic_rules(title: str, brand: str, made_in_france: bool, max_len: int = MAX_TITLE_LEN) -> str:
+    """
+    Règles “implicites” + garanties:
+    - commence par Nappe
+    - 1 seule occurrence marque, à la fin
+    - ajoute Made in France si détecté
+    - max 150 chars en préservant le suffix
+    - Title Case “Camel case visuel”
+    """
     t = normalize_spaces(title)
 
-    # doit commencer par "Nappe"
+    # retire marque + Made in France éventuels dans le corps
+    t = remove_brand_occurrences(t, brand)
+    t = re.sub(r"\bmade\s+in\s+france\b", " ", t, flags=re.IGNORECASE)
+    t = normalize_spaces(t).strip(" -")
+
+    # doit commencer par Nappe
     if t and not t.lower().startswith("nappe"):
         t = "Nappe " + t
+    t = normalize_spaces(t).strip(" -")
 
-    # marque en fin
-    t = ensure_brand_suffix(t, brand)
+    # suffix final (unique)
+    suffix = f" - Made in France - {brand}" if made_in_france else f" - {brand}"
 
-    # ajoute Made in France avant marque si nécessaire
-    if made_in_france:
-        suffix_brand = f" - {brand}"
-        if t.endswith(suffix_brand):
-            main = t[:-len(suffix_brand)].strip(" -")
-            suffix = f" - Made in France - {brand}"
-            t = truncate_preserve_suffix(main, suffix, max_len)
-        else:
-            t = truncate_preserve_suffix(t, "", max_len)
+    # tronque en préservant suffix
+    t = truncate_preserve_suffix(t, suffix, max_len)
 
-    # Camel case visuel
+    # Title Case
     t = smart_title_case(t, brand)
 
-    # sécurité max len
+    # re-garantie marque unique en fin (au cas où)
+    t_main = remove_brand_occurrences(t, brand)
+    t_main = re.sub(r"\bmade\s+in\s+france\b", " ", t_main, flags=re.IGNORECASE)
+    t_main = normalize_spaces(t_main).strip(" -")
+    if t_main and not t_main.lower().startswith("nappe"):
+        t_main = "Nappe " + t_main
+
+    t = truncate_preserve_suffix(t_main, suffix, max_len)
+    t = smart_title_case(t, brand)  # remet aussi "Made in France" correctement
     t = t[:max_len].rstrip()
+
     return t
 
 def validate_title(title: str, brand: str) -> List[str]:
@@ -268,11 +272,10 @@ def validate_title(title: str, brand: str) -> List[str]:
         issues.append(f"trop long ({len(t)} > {MAX_TITLE_LEN})")
     if not t.lower().startswith("nappe"):
         issues.append("ne commence pas par 'Nappe'")
-    count_brand = t.lower().count(brand.lower())
-    if count_brand == 0:
-        issues.append("marque absente")
-    elif count_brand > 1:
-        issues.append("marque présente plusieurs fois")
+    if t.lower().count(brand.lower()) != 1:
+        issues.append("marque != 1 occurrence")
+    if not t.lower().endswith(brand.lower()):
+        issues.append("marque pas en fin")
     if re.search(r"\bpromo\b|\bréduc\b|\breduction\b|%|€", t.lower()):
         issues.append("contient promo/prix")
     return issues
@@ -322,6 +325,8 @@ def openai_generate_structured(
     schema: Dict[str, Any],
     temperature: float = 0.2,
     max_output_tokens: int = 240,
+    retries: int = 3,
+    backoff_s: float = 1.5,
 ) -> Dict[str, Any]:
     payload = {
         "model": model,
@@ -342,27 +347,39 @@ def openai_generate_structured(
         },
     }
 
-    r = requests.post(
-        OPENAI_URL,
-        headers={"Authorization": f"Bearer {api_key}"},
-        json=payload,
-        timeout=60,
-    )
+    last_err = None
+    for attempt in range(retries + 1):
+        r = requests.post(
+            OPENAI_URL,
+            headers={"Authorization": f"Bearer {api_key}"},
+            json=payload,
+            timeout=90,
+        )
 
-    if r.status_code < 200 or r.status_code >= 300:
+        if 200 <= r.status_code < 300:
+            data = r.json()
+            txt = extract_output_text(data)
+            return json.loads(txt)
+
+        # Erreur lisible
         try:
             j = r.json()
             err = j.get("error", {})
             msg = err.get("message", r.text)
             code = err.get("code", "")
             typ = err.get("type", "")
-            raise RuntimeError(f"OpenAI HTTP {r.status_code} | type={typ} code={code} | {msg}")
+            last_err = f"OpenAI HTTP {r.status_code} | type={typ} code={code} | {msg}"
         except Exception:
-            raise RuntimeError(f"OpenAI HTTP {r.status_code} | {r.text}")
+            last_err = f"OpenAI HTTP {r.status_code} | {r.text}"
 
-    data = r.json()
-    txt = extract_output_text(data)
-    return json.loads(txt)
+        # Retry sur 429 / 5xx
+        if r.status_code in (429, 500, 502, 503, 504) and attempt < retries:
+            time.sleep(backoff_s * (attempt + 1))
+            continue
+
+        raise RuntimeError(last_err)
+
+    raise RuntimeError(last_err or "OpenAI error (unknown)")
 
 # =========================
 # OPTIMIZER (NAPPES)
@@ -375,9 +392,10 @@ def optimize_nappe_title(
     current_title: str,
     description: str,
     keywords: List[KeywordRow],
+    per_call_sleep_s: float = 0.0,
 ) -> Dict[str, Any]:
     current_title = (current_title or "")[:220]
-    description = (description or "")[:1200]
+    description = (description or "")[:1500]
 
     made_in_fr = has_made_in_france(description)
 
@@ -422,15 +440,16 @@ Contraintes strictes:
 - Le title DOIT commencer par "Nappe".
 - Utiliser 1 à 2 mots-clés parmi les candidats SI (et seulement si) cohérents avec le produit décrit.
 - N'ajoute PAS d'attributs non présents dans le title actuel ou la description (ne rien inventer).
-- Pas de promo, pas de prix, pas de superlatifs gratuits.
-- Marque une seule fois, de préférence en fin (ex: "- {brand}").
+- Pas de promo, pas de prix.
+- Marque une seule fois, de préférence en fin.
 - Longueur max: {MAX_TITLE_LEN} caractères.
 Rends:
 - optimized_title
-- used_keywords (0 à 2)
-- notes (1 phrase)
+- used_keywords
+- notes
 """.strip()
 
+    # appel principal + fallback modèle
     try:
         out = openai_generate_structured(
             api_key=api_key,
@@ -440,6 +459,8 @@ Rends:
             schema=schema,
             temperature=0.2,
             max_output_tokens=240,
+            retries=3,
+            backoff_s=1.5,
         )
     except RuntimeError as e:
         msg = str(e).lower()
@@ -452,15 +473,22 @@ Rends:
                 schema=schema,
                 temperature=0.2,
                 max_output_tokens=240,
+                retries=3,
+                backoff_s=1.5,
             )
         else:
             raise
 
+    # Garde-fous + made in france + marque unique en fin + 150 chars + title case
     opt = enforce_basic_rules(out["optimized_title"], brand, made_in_fr, max_len=MAX_TITLE_LEN)
     issues = validate_title(opt, brand)
     adds = added_terms(current_title, opt)
 
+    if per_call_sleep_s and per_call_sleep_s > 0:
+        time.sleep(per_call_sleep_s)
+
     return {
+        "source_row_index": None,  # rempli dans la boucle
         "title_current": current_title,
         "description_has_made_in_france": "Oui" if made_in_fr else "Non",
         "title_optimized": opt,
@@ -475,7 +503,7 @@ Rends:
 # STREAMLIT UI
 # =========================
 st.set_page_config(page_title="GMC Title Optimizer (Nappes)", layout="wide")
-st.title("Optimisation Titles GMC — Nappes (keyword + volume) → export Excel (.xlsx)")
+st.title("Optimisation Titles GMC — Nappes (keyword + volume) → export Excel")
 
 # secrets -> env
 if "OPENAI_API_KEY" in st.secrets:
@@ -490,7 +518,8 @@ with st.sidebar:
     st.header("Paramètres")
     brand = st.text_input("Marque", BRAND_DEFAULT)
     model = st.selectbox("Modèle", ["gpt-4o-mini", "gpt-5-mini"], index=0)
-    n_rows = st.slider("Nombre de lignes à traiter (démo)", 1, 200, 10)
+    per_call_sleep_s = st.slider("Pause entre appels API (sec)", 0.0, 2.0, 0.2, 0.1)
+    st.caption("Augmente si tu as des 429 (rate limit).")
 
     if st.button("Tester la clé + lister les modèles"):
         try:
@@ -556,15 +585,36 @@ if not keywords:
     st.error("Aucun mot-clé valide détecté (vérifie les colonnes keyword/volume).")
     st.stop()
 
-st.subheader("3) Optimisation + Export Excel")
+st.subheader("3) Traitement (au-delà de la démo)")
+total_rows = len(df_prod)
+
+colA, colB, colC = st.columns([1, 1, 2])
+with colA:
+    start_index = st.number_input("Index de départ (0 = 1ère ligne)", min_value=0, max_value=max(0, total_rows - 1), value=0, step=1)
+with colB:
+    treat_all = st.checkbox("Traiter toutes les lignes (à partir de l’index)", value=False)
+with colC:
+    if treat_all:
+        n_rows = total_rows - int(start_index)
+        st.write(f"Traitement prévu : **{n_rows}** ligne(s) (sur {total_rows})")
+    else:
+        n_rows = st.number_input("Nombre de lignes à traiter", min_value=1, max_value=max(1, total_rows - int(start_index)), value=min(50, max(1, total_rows - int(start_index))), step=1)
+
 if st.button("Optimiser les titles (Nappes)"):
-    df = df_prod.head(n_rows).copy()
+    start_index = int(start_index)
+    n_rows = int(n_rows)
+    end_index = min(total_rows, start_index + n_rows)
+
     results = []
     prog = st.progress(0)
+    status = st.empty()
 
-    for i, (_, row) in enumerate(df.iterrows(), start=1):
+    for pos, i in enumerate(range(start_index, end_index), start=1):
+        row = df_prod.iloc[i]
         cur_title = str(row[col_title]) if pd.notna(row[col_title]) else ""
         desc = str(row[col_desc]) if pd.notna(row[col_desc]) else ""
+
+        status.write(f"Ligne {i} ({pos}/{end_index-start_index}) …")
 
         try:
             out = optimize_nappe_title(
@@ -574,10 +624,13 @@ if st.button("Optimiser les titles (Nappes)"):
                 current_title=cur_title,
                 description=desc,
                 keywords=keywords,
+                per_call_sleep_s=per_call_sleep_s,
             )
+            out["source_row_index"] = i
             results.append(out)
         except Exception as e:
             results.append({
+                "source_row_index": i,
                 "title_current": cur_title,
                 "description_has_made_in_france": "",
                 "title_optimized": "",
@@ -588,7 +641,7 @@ if st.button("Optimiser les titles (Nappes)"):
                 "keyword_candidates": "",
             })
 
-        prog.progress(min(1.0, i / max(1, n_rows)))
+        prog.progress(min(1.0, pos / max(1, (end_index - start_index))))
 
     res_df = pd.DataFrame(results)
     st.success("Terminé ✅")
@@ -598,6 +651,6 @@ if st.button("Optimiser les titles (Nappes)"):
     st.download_button(
         "Télécharger le résultat (Excel .xlsx)",
         data=xlsx_bytes,
-        file_name="gmc_titles_nappes_optimized.xlsx",
+        file_name=f"gmc_titles_nappes_optimized_{start_index}_{end_index-1}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
